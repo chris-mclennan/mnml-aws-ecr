@@ -48,9 +48,52 @@ pub struct ImageDetail {
     #[serde(rename = "artifactMediaType", default)]
     pub artifact_media_type: Option<String>,
     #[serde(rename = "imageScanFindingsSummary", default)]
-    pub scan_summary: Option<serde_json::Value>,
+    pub scan_summary: Option<ScanFindingsSummary>,
     #[serde(rename = "imageScanStatus", default)]
-    pub scan_status: Option<serde_json::Value>,
+    pub scan_status: Option<ScanStatus>,
+}
+
+/// Subset of the `imageScanFindingsSummary` shape — the per-severity
+/// vulnerability counts. AWS includes the keys `CRITICAL`, `HIGH`,
+/// `MEDIUM`, `LOW`, `INFORMATIONAL`, `UNDEFINED`; missing keys mean
+/// zero. Stored as a HashMap to forward-compat new severities.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanFindingsSummary {
+    #[serde(rename = "imageScanCompletedAt", default)]
+    pub completed_at: Option<String>,
+    #[serde(rename = "vulnerabilitySourceUpdatedAt", default)]
+    pub vuln_source_updated_at: Option<String>,
+    #[serde(rename = "findingSeverityCounts", default)]
+    pub counts: std::collections::HashMap<String, u64>,
+}
+
+impl ScanFindingsSummary {
+    pub fn critical(&self) -> u64 {
+        self.counts.get("CRITICAL").copied().unwrap_or(0)
+    }
+    pub fn high(&self) -> u64 {
+        self.counts.get("HIGH").copied().unwrap_or(0)
+    }
+    pub fn medium(&self) -> u64 {
+        self.counts.get("MEDIUM").copied().unwrap_or(0)
+    }
+    pub fn low(&self) -> u64 {
+        self.counts.get("LOW").copied().unwrap_or(0)
+    }
+    pub fn informational(&self) -> u64 {
+        self.counts.get("INFORMATIONAL").copied().unwrap_or(0)
+    }
+    pub fn total(&self) -> u64 {
+        self.critical() + self.high() + self.medium() + self.low() + self.informational()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanStatus {
+    #[serde(rename = "status", default)]
+    pub status: Option<String>,
+    #[serde(rename = "description", default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,10 +152,22 @@ impl Item {
                     .map(short_timestamp)
                     .unwrap_or_else(|| "—".into());
                 let extra_tags = i.tags.len().saturating_sub(1);
+                // ⚠ Critical/high vulnerability chip — surfaces images
+                // with scan findings. Critical wins over high; we only
+                // show one chip to keep the row scannable.
+                let scan_chip = match i.scan_summary.as_ref() {
+                    Some(s) if s.critical() > 0 => {
+                        format!(" · ⚠ {}c", s.critical())
+                    }
+                    Some(s) if s.high() > 0 => {
+                        format!(" · ⚠ {}h", s.high())
+                    }
+                    _ => String::new(),
+                };
                 if extra_tags > 0 {
-                    format!("{size} · {pushed} · +{extra_tags} tag(s)")
+                    format!("{size} · {pushed} · +{extra_tags} tag(s){scan_chip}")
                 } else {
-                    format!("{size} · {pushed}")
+                    format!("{size} · {pushed}{scan_chip}")
                 }
             }
         }
@@ -300,5 +355,97 @@ mod tests {
             "abc123456789"
         );
         assert_eq!(short_digest("noprefix"), "noprefix");
+    }
+
+    #[test]
+    fn parses_scan_findings_summary() {
+        let json = r#"{
+            "imageDetails": [
+                {
+                    "repositoryName": "api",
+                    "imageDigest": "sha256:abc",
+                    "imageTags": ["v1.2.3"],
+                    "imageScanFindingsSummary": {
+                        "imageScanCompletedAt": "2026-06-06T18:30:00.000Z",
+                        "findingSeverityCounts": {
+                            "CRITICAL": 2,
+                            "HIGH": 5,
+                            "MEDIUM": 10,
+                            "LOW": 8,
+                            "INFORMATIONAL": 3
+                        }
+                    },
+                    "imageScanStatus": {
+                        "status": "COMPLETE",
+                        "description": "The scan was completed successfully."
+                    }
+                }
+            ]
+        }"#;
+        let resp: DescribeImagesResponse = serde_json::from_str(json).unwrap();
+        let img = &resp.image_details[0];
+        let scan = img.scan_summary.as_ref().expect("scan summary present");
+        assert_eq!(scan.critical(), 2);
+        assert_eq!(scan.high(), 5);
+        assert_eq!(scan.medium(), 10);
+        assert_eq!(scan.low(), 8);
+        assert_eq!(scan.informational(), 3);
+        assert_eq!(scan.total(), 28);
+        let status = img.scan_status.as_ref().expect("scan status present");
+        assert_eq!(status.status.as_deref(), Some("COMPLETE"));
+    }
+
+    #[test]
+    fn scan_summary_missing_severity_counts_as_zero() {
+        let json = r#"{
+            "findingSeverityCounts": {"CRITICAL": 1}
+        }"#;
+        let scan: ScanFindingsSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(scan.critical(), 1);
+        assert_eq!(scan.high(), 0);
+        assert_eq!(scan.medium(), 0);
+    }
+
+    #[test]
+    fn item_secondary_label_surfaces_critical_chip() {
+        let img = ImageDetail {
+            repository_name: "api".into(),
+            digest: None,
+            tags: vec!["v1".into()],
+            size_bytes: Some(1024 * 1024),
+            pushed_at: None,
+            manifest_media_type: None,
+            artifact_media_type: None,
+            scan_summary: Some(ScanFindingsSummary {
+                completed_at: None,
+                vuln_source_updated_at: None,
+                counts: [("CRITICAL".to_string(), 3)].into_iter().collect(),
+            }),
+            scan_status: None,
+        };
+        let label = Item::Image(img).secondary_label();
+        assert!(label.contains("⚠ 3c"));
+    }
+
+    #[test]
+    fn item_secondary_label_falls_back_to_high_chip() {
+        let img = ImageDetail {
+            repository_name: "api".into(),
+            digest: None,
+            tags: vec!["v1".into()],
+            size_bytes: None,
+            pushed_at: None,
+            manifest_media_type: None,
+            artifact_media_type: None,
+            scan_summary: Some(ScanFindingsSummary {
+                completed_at: None,
+                vuln_source_updated_at: None,
+                counts: [("HIGH".to_string(), 7)].into_iter().collect(),
+            }),
+            scan_status: None,
+        };
+        let label = Item::Image(img).secondary_label();
+        assert!(label.contains("⚠ 7h"));
+        assert!(!label.contains("c"));
     }
 }

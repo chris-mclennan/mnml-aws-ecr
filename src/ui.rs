@@ -148,7 +148,7 @@ fn draw_list(f: &mut Frame, area: Rect, tab: &TabState) {
             let style = if abs == selected {
                 Style::default().fg(Color::Black).bg(Color::Cyan)
             } else {
-                Style::default().fg(Color::Gray)
+                vuln_color_for(item)
             };
             Line::from(Span::styled(line, style))
         })
@@ -164,6 +164,29 @@ fn draw_list(f: &mut Frame, area: Rect, tab: &TabState) {
     };
     let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
+}
+
+/// Image rows get a color cue from their scan findings:
+/// - any CRITICAL → red
+/// - any HIGH (and no CRITICAL) → yellow
+/// - clean (scan ran, zero findings) → green
+/// - no scan summary → gray (default)
+fn vuln_color_for(item: &Item) -> Style {
+    let Item::Image(i) = item else {
+        return Style::default().fg(Color::Gray);
+    };
+    let Some(scan) = &i.scan_summary else {
+        return Style::default().fg(Color::Gray);
+    };
+    if scan.critical() > 0 {
+        Style::default().fg(Color::Red)
+    } else if scan.high() > 0 {
+        Style::default().fg(Color::Yellow)
+    } else if scan.total() == 0 {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
 }
 
 fn draw_detail(f: &mut Frame, area: Rect, item: Option<&Item>) {
@@ -235,6 +258,59 @@ fn draw_detail(f: &mut Frame, area: Rect, item: Option<&Item>) {
             }
             if let Some(artifact) = &i.artifact_media_type {
                 lines.push(kv("Artifact", artifact.clone()));
+            }
+            // Scan findings — per-severity vulnerability count breakdown.
+            // We render this section even when all counts are zero,
+            // because "zero criticals" is meaningful context (the
+            // scan ran and found nothing). When scan_summary is None
+            // entirely, the scan hasn't run.
+            if let Some(scan) = &i.scan_summary {
+                lines.push(Line::from(""));
+                let total = scan.total();
+                lines.push(Line::from(vec![Span::styled(
+                    format!(" Vulnerability scan ({total} findings) "),
+                    Style::default().fg(Color::DarkGray),
+                )]));
+                let severities = [
+                    ("CRITICAL", scan.critical(), Color::Red),
+                    ("HIGH", scan.high(), Color::Yellow),
+                    ("MEDIUM", scan.medium(), Color::Cyan),
+                    ("LOW", scan.low(), Color::Gray),
+                    ("INFO", scan.informational(), Color::DarkGray),
+                ];
+                for (label, count, color) in severities {
+                    if count == 0 {
+                        continue;
+                    }
+                    lines.push(Line::from(vec![
+                        Span::styled(format!(" {label:<10}"), Style::default().fg(color)),
+                        Span::styled(count.to_string(), Style::default().fg(Color::White)),
+                    ]));
+                }
+                if total == 0 {
+                    lines.push(Line::from(Span::styled(
+                        " (clean — no findings)",
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+                if let Some(completed) = &scan.completed_at {
+                    lines.push(Line::from(Span::styled(
+                        format!(" scanned: {}", short_timestamp(completed)),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    )));
+                }
+            } else if let Some(status) = &i.scan_status
+                && let Some(s) = &status.status
+            {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!(" Scan: {s}"),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                )));
             }
             lines.push(Line::from(""));
             lines.push(Line::from(vec![Span::styled(
